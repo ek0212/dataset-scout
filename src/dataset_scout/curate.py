@@ -60,6 +60,58 @@ JSONL_FILENAMES = {
 }
 
 
+# Number of rows to probe up-front for label_column type validation.
+# Picked small so we trip on bad recipes without prefetching real work.
+_LABEL_TYPE_PROBE_N = 20
+
+# Fraction of probed rows whose label_column value must be unmappable
+# before we declare the column genuinely wrong (vs. a few legitimate
+# unmapped rows that should silently drop, per existing behaviour).
+_LABEL_TYPE_BAD_FRACTION_THRESHOLD = 0.5
+
+
+class LabelColumnTypeMismatch(DatasetScoutError):
+    """Recipe's `label_column` doesn't hold a coercible scalar label.
+
+    Raised by ``_materialize_component`` after probing the first
+    ``_LABEL_TYPE_PROBE_N`` rows when more than 50% of sampled values
+    are list/dict-typed, all-None, or have ``str(...)`` representations
+    not in ``label_value_map``. The component is then surfaced as a
+    skipped failure (category ``label_column_type_mismatch``) in the
+    lockfile and report so the recipe can be fixed, rather than silently
+    materialising 0 rows.
+
+    Regression: strategy assessor sometimes infers a `label_column` from
+    column NAME alone (e.g. HarmBench's `positive` column, which is
+    actually a list<string> of completion examples).
+    """
+
+    def __init__(
+        self,
+        *,
+        column: str,
+        observed_type: str,
+        sample_value: Any,
+        bad_fraction: float,
+        sampled: int,
+    ) -> None:
+        self.column = column
+        self.observed_type = observed_type
+        self.sample_value = sample_value
+        self.bad_fraction = bad_fraction
+        self.sampled = sampled
+        sample_repr = repr(sample_value)
+        if len(sample_repr) > 120:
+            sample_repr = sample_repr[:117] + "..."
+        super().__init__(
+            f"label_column={column!r} cannot be coerced to a discrete label: "
+            f"{bad_fraction:.0%} of the first {sampled} sampled row(s) hold "
+            f"an unmappable value (observed type {observed_type}, sample "
+            f"{sample_repr}). Fix transform.label_column or "
+            f"transform.label_value_map and re-run curate."
+        )
+
+
 # ─── public types ────────────────────────────────────────────────────
 
 
@@ -299,7 +351,15 @@ def _classify_component_failure(c: RecipeComponent, exc: BaseException) -> dict[
     # Source explicitly does not support streaming for this candidate
     # (e.g. Kaggle, which is discovery-only). Distinct from "no rows" —
     # this is structural, not a transient blip.
-    if "SourceUnsupportedError" in type_name:
+    if "LabelColumnTypeMismatch" in type_name:
+        category = "label_column_type_mismatch"
+        hint = (
+            "The proposed `label_column` doesn't hold a scalar label that "
+            "maps via `label_value_map`. Inspect the dataset and either "
+            "pick a different label_column, set it to null (and rely on "
+            "`label_value_map: {all: <label>}`), or extend the value map."
+        )
+    elif "SourceUnsupportedError" in type_name:
         category = "unsupported_source"
         hint = (
             "This source does not support streaming rows (e.g. Kaggle is "
@@ -404,7 +464,27 @@ def _materialize_component(
         split=component.source_split,
         take=take_int,
     )
-    for i, row in enumerate(rows):
+    rows_iter = iter(rows)
+
+    # Buffer the first N rows up-front so we can validate that the
+    # recipe's label_column actually holds a coercible scalar label.
+    # This catches strategy-assessor mistakes (e.g. inferring
+    # label_column from column NAME when the column is really a
+    # list<string>) before curate silently writes 0 rows.
+    probe: list[dict[str, Any]] = []
+    if component.transform.label_column is not None:
+        for probed in rows_iter:
+            probe.append(probed)
+            if len(probe) >= _LABEL_TYPE_PROBE_N:
+                break
+        if probe:
+            _validate_label_column_sample(component, probe)
+
+    def _stream() -> Iterator[dict[str, Any]]:
+        yield from probe
+        yield from rows_iter
+
+    for i, row in enumerate(_stream()):
         if filter_fn is not None:
             try:
                 if not filter_fn(row):
@@ -414,6 +494,62 @@ def _materialize_component(
         rec = _row_to_record(component, row, i, threat_family)
         if rec is not None:
             yield rec
+
+
+def _validate_label_column_sample(
+    component: RecipeComponent,
+    sample: list[dict[str, Any]],
+) -> None:
+    """Raise ``LabelColumnTypeMismatch`` if the sample's label_column is unusable.
+
+    A row is "bad" if its `label_column` value is missing/None, a
+    container type (list/dict/tuple/set), or a scalar whose
+    ``str(...)`` form isn't a key in ``label_value_map``. If more
+    than 50% of the sample is bad, we treat the recipe column choice
+    as broken rather than silently dropping every row.
+    """
+    transform = component.transform
+    label_col = transform.label_column
+    if label_col is None or not sample:
+        return
+
+    bad = 0
+    first_bad_value: Any = None
+    first_bad_type: str | None = None
+
+    def _record_bad(v: Any) -> None:
+        nonlocal first_bad_value, first_bad_type
+        if first_bad_type is None:
+            first_bad_value = v
+            first_bad_type = type(v).__name__
+
+    for row in sample:
+        if label_col not in row:
+            bad += 1
+            _record_bad(None)
+            continue
+        v = row[label_col]
+        if v is None:
+            bad += 1
+            _record_bad(None)
+            continue
+        if isinstance(v, list | dict | tuple | set):
+            bad += 1
+            _record_bad(v)
+            continue
+        if str(v) not in transform.label_value_map:
+            bad += 1
+            _record_bad(v)
+
+    fraction = bad / len(sample)
+    if fraction > _LABEL_TYPE_BAD_FRACTION_THRESHOLD:
+        raise LabelColumnTypeMismatch(
+            column=label_col,
+            observed_type=first_bad_type or "unknown",
+            sample_value=first_bad_value,
+            bad_fraction=fraction,
+            sampled=len(sample),
+        )
 
 
 def _component_to_candidate(component: RecipeComponent) -> Any:
